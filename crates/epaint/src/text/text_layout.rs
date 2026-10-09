@@ -88,6 +88,39 @@ impl Paragraph {
 /// In most cases you should use [`crate::FontsView::layout_job`] instead
 /// since that memoizes the input, making subsequent layouting of the same text much faster.
 pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>) -> Galley {
+    layout_impl(fonts, pixels_per_point, job, None, None)
+}
+
+/// Exact shaped cluster ranges, captured only by the opt-in single-line API.
+pub(crate) struct RawCluster {
+    pub bytes: Range<usize>,
+    pub advance: (f32, f32),
+}
+
+pub(crate) fn layout_with_clusters(
+    fonts: &mut FontsImpl,
+    pixels_per_point: f32,
+    job: Arc<LayoutJob>,
+    directions: &[bool],
+) -> (Galley, Vec<RawCluster>) {
+    let mut clusters = Vec::new();
+    let galley = layout_impl(
+        fonts,
+        pixels_per_point,
+        job,
+        Some(&mut clusters),
+        Some(directions),
+    );
+    (galley, clusters)
+}
+
+fn layout_impl(
+    fonts: &mut FontsImpl,
+    pixels_per_point: f32,
+    job: Arc<LayoutJob>,
+    mut clusters: Option<&mut Vec<RawCluster>>,
+    directions: Option<&[bool]>,
+) -> Galley {
     profiling::function_scope!();
 
     job.debug_sanity_check();
@@ -121,6 +154,8 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
                 section_index as u32,
                 section,
                 &mut paragraphs,
+                clusters.as_deref_mut(),
+                directions.map(|directions| directions[section_index]),
             );
         }
         fonts.return_shape_buffer(shape_buffer);
@@ -234,7 +269,24 @@ fn layout_shaped_run(
     face_metrics: &StyledMetrics,
     ctx: &mut ShapingContext,
     paragraph: &mut Paragraph,
+    source_start: usize,
+    mut clusters: Option<&mut Vec<RawCluster>>,
 ) {
+    let collect = clusters.is_some();
+    // HarfRust returns monotone clusters, descending for RTL. Sorted byte offsets
+    // determine source ranges without guessing from characters or glyph advances.
+    let mut boundaries = Vec::new();
+    if collect {
+        boundaries.extend(
+            glyph_buffer
+                .glyph_infos()
+                .iter()
+                .map(|info| info.cluster as usize),
+        );
+        boundaries.push(run_text.len());
+        boundaries.sort_unstable();
+        boundaries.dedup();
+    }
     let px_scale = face_metrics.px_scale_factor;
 
     // Reset cluster tracking — cluster values are byte offsets within run_text,
@@ -282,7 +334,7 @@ fn layout_shaped_run(
         // never between glyphs within the same cluster (e.g. base + mark).
         let is_new_cluster = ctx.prev_cluster.is_none_or(|pc| pc != cluster);
         if is_new_cluster {
-            if ctx.prev_cluster.is_some() {
+            if !collect && ctx.prev_cluster.is_some() {
                 emit_continuation_glyphs(
                     ctx,
                     paragraph,
@@ -301,6 +353,7 @@ fn layout_shaped_run(
         }
         ctx.prev_cluster = Some(cluster);
 
+        let pen_start = paragraph.cursor_x_px / ctx.pixels_per_point;
         let glyph = if glyph_id == skrifa::GlyphId::NOTDEF {
             // The shaper couldn't map this character. Drop combining marks and duplicate
             // NOTDEF glyphs within the same cluster. The first base character is rasterized,
@@ -383,11 +436,24 @@ fn layout_shaped_run(
             ctx.glyph(chr, x_px, advance_width_px, face_metrics, glyph_alloc)
         };
         paragraph.glyphs.push(glyph);
+        if let Some(clusters) = clusters.as_deref_mut() {
+            let from = source_start + cluster as usize;
+            if let Some(last) = clusters.last_mut().filter(|last| last.bytes.start == from) {
+                last.advance.1 = paragraph.cursor_x_px / ctx.pixels_per_point;
+            } else {
+                let boundary = boundaries.partition_point(|offset| *offset <= cluster as usize);
+                let end = boundaries.get(boundary).copied().unwrap_or(run_text.len());
+                clusters.push(RawCluster {
+                    bytes: from..source_start + end,
+                    advance: (pen_start, paragraph.cursor_x_px / ctx.pixels_per_point),
+                });
+            }
+        }
         cluster_glyph_count += 1;
     }
 
     // Emit continuation glyphs for the last cluster in the run.
-    if ctx.prev_cluster.is_some() {
+    if !collect && ctx.prev_cluster.is_some() {
         emit_continuation_glyphs(
             ctx,
             paragraph,
@@ -521,6 +587,8 @@ fn layout_section(
     section_index: u32,
     section: &LayoutSection,
     out_paragraphs: &mut Vec<Paragraph>,
+    mut clusters: Option<&mut Vec<RawCluster>>,
+    right_to_left: Option<bool>,
 ) -> harfrust::UnicodeBuffer {
     let LayoutSection {
         leading_space,
@@ -572,10 +640,24 @@ fn layout_section(
         segment_into_runs(fonts, &ctx, segment, &mut runs);
 
         let num_runs = runs.len();
-        for (run_idx, run) in runs.iter().enumerate() {
+        for run_idx in 0..runs.len() {
+            let index = if right_to_left == Some(true) {
+                num_runs - 1 - run_idx
+            } else {
+                run_idx
+            };
+            let run = &runs[index];
             let run_text = &segment[run.byte_range.as_usize()];
             if let Some(raster) = &run.raster {
+                let pen_start = paragraph.cursor_x_px / ctx.pixels_per_point;
                 layout_raster_run(&mut ctx, paragraph, run_text, raster);
+                if let Some(clusters) = clusters.as_deref_mut() {
+                    let source_start = byte_range.start.0 + run.byte_range.start.0;
+                    clusters.push(RawCluster {
+                        bytes: source_start..source_start + run_text.len(),
+                        advance: (pen_start, paragraph.cursor_x_px / ctx.pixels_per_point),
+                    });
+                }
                 continue;
             }
             let Some(font_face) = fonts.face(run.font_key) else {
@@ -598,7 +680,14 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            let glyph_buffer = shape_text(font_face, run_text, &format.coords, shape_buffer, flags);
+            let glyph_buffer = shape_text(
+                font_face,
+                run_text,
+                &format.coords,
+                shape_buffer,
+                flags,
+                right_to_left,
+            );
 
             layout_shaped_run(
                 fonts,
@@ -608,6 +697,8 @@ fn layout_section(
                 &face_metrics,
                 &mut ctx,
                 paragraph,
+                byte_range.start.0 + run.byte_range.start.0,
+                clusters.as_deref_mut(),
             );
 
             shape_buffer = glyph_buffer.clear();
@@ -1575,6 +1666,7 @@ fn shape_text(
     coords: &VariationCoords,
     mut buffer: harfrust::UnicodeBuffer,
     flags: harfrust::BufferFlags,
+    right_to_left: Option<bool>,
 ) -> harfrust::GlyphBuffer {
     let font_ref = font_face.skrifa_font_ref();
     let tweak = font_face.tweak();
@@ -1601,6 +1693,13 @@ fn shape_text(
     buffer.set_flags(flags);
     buffer.push_str(text);
     buffer.guess_segment_properties();
+    if let Some(rtl) = right_to_left {
+        buffer.set_direction(if rtl {
+            harfrust::Direction::RightToLeft
+        } else {
+            harfrust::Direction::LeftToRight
+        });
+    }
 
     shaper.shape(buffer, harfrust::ShapeOptions::new())
 }

@@ -1,3 +1,4 @@
+use emath::Rect;
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
@@ -118,6 +119,7 @@ impl Fonts {
     pub fn add_glyph_rasterizer(&mut self, glyph_rasterizer: GlyphRasterizer) -> bool {
         let changed = self.fonts.add_glyph_rasterizer(glyph_rasterizer);
         if changed {
+            self.fonts.layout_generation = next_layout_generation();
             self.galley_caches.clear();
         }
         changed
@@ -128,6 +130,7 @@ impl Fonts {
     /// Pass an empty list to only use the installed fonts.
     pub fn set_glyph_rasterizers(&mut self, glyph_rasterizers: Vec<GlyphRasterizer>) {
         self.fonts.set_glyph_rasterizers(glyph_rasterizers);
+        self.fonts.layout_generation = next_layout_generation();
         self.galley_caches.clear();
     }
 
@@ -158,6 +161,7 @@ impl Fonts {
     pub fn set_missing_glyph_policy(&mut self, policy: MissingGlyphPolicy) {
         if self.fonts.missing_glyph_policy != policy {
             self.fonts.missing_glyph_policy = policy;
+            self.fonts.layout_generation = next_layout_generation();
             self.galley_caches.clear(); // Cached galleys may contain tofu.
         }
     }
@@ -177,10 +181,12 @@ impl Fonts {
     pub fn begin_pass(&mut self, options: TextOptions, viewport_key: ViewportKey) {
         if self.fonts.options() != &options {
             self.fonts.set_options(options);
+            self.fonts.layout_generation = next_layout_generation();
             self.galley_caches.clear(); // Galleys point into the old atlas.
         } else if 0.8 < self.fonts.glyphs.fill_ratio() {
             // The parsed faces are still fine; only the bitmaps need to go.
             self.fonts.glyphs.clear();
+            self.fonts.layout_generation = next_layout_generation();
             self.galley_caches.clear(); // Galleys point into the old atlas.
         }
 
@@ -327,6 +333,13 @@ pub struct FontsView<'a> {
 }
 
 impl FontsView<'_> {
+    /// Process-wide identity changes on font reconstruction and native galley invalidation.
+    /// External layout caches must compare this before reusing atlas-backed meshes.
+    #[inline]
+    pub fn layout_generation(&self) -> usize {
+        self.fonts.layout_generation
+    }
+
     #[inline]
     pub fn options(&self) -> &TextOptions {
         self.fonts.options()
@@ -426,6 +439,54 @@ impl FontsView<'_> {
         )
     }
 
+    /// Shape one already bidi-resolved visual line and expose exact source clusters.
+    ///
+    /// The caller supplies one direction per section (`true` means RTL) and owns bounded
+    /// caching. No layout cache or default layout behavior is changed. Newlines
+    /// must be split before calling; automatic wrapping is intentionally disabled.
+    pub fn layout_single_line_with_clusters(
+        &mut self,
+        mut job: LayoutJob,
+        directions: &[bool],
+    ) -> ShapedLine {
+        assert_eq!(
+            job.sections.len(),
+            directions.len(),
+            "one direction per section"
+        );
+        assert!(!job.text.contains(['\n', '\r']), "shape one line at a time");
+        job.break_on_newline = false;
+        job.wrap.max_width = f32::INFINITY;
+        job.wrap.max_rows = 1;
+        job.halign = emath::Align::LEFT;
+        job.justify = false;
+        *self.used_since_begin_pass = true;
+        let (galley, raw) = super::text_layout::layout_with_clusters(
+            self.fonts,
+            self.pixels_per_point,
+            Arc::new(job),
+            directions,
+        );
+        let clusters = raw
+            .into_iter()
+            .filter_map(|cluster| {
+                let row = galley.rows.first()?;
+                let rect = Rect::from_min_max(
+                    emath::pos2(cluster.advance.0, 0.0),
+                    emath::pos2(cluster.advance.1, row.size.y),
+                );
+                Some(ShapedCluster {
+                    bytes: cluster.bytes,
+                    rect: rect.translate(row.pos.to_vec2()),
+                })
+            })
+            .collect();
+        ShapedLine {
+            galley: Arc::new(galley),
+            clusters,
+        }
+    }
+
     pub fn num_galleys_in_cache(&self) -> usize {
         self.galley_cache.num_galleys_in_cache()
     }
@@ -482,6 +543,7 @@ impl FontsView<'_> {
 ///
 /// Required in order to paint text.
 pub(crate) struct FontsImpl {
+    layout_generation: usize,
     definitions: Arc<FontDefinitions>,
     glyphs: GlyphAtlas,
     faces: FaceStore,
@@ -505,11 +567,19 @@ pub(crate) struct FontsImpl {
     synthetic_tofu: GlyphRasterizer,
 }
 
+// Like FontFaceKey, this uses a process-wide counter so replacing Fonts cannot
+// collide with an external cache still holding meshes from the previous instance.
+fn next_layout_generation() -> usize {
+    static GENERATION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+    GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 impl FontsImpl {
     /// Create a new [`FontsImpl`] for text layout.
     /// This call is expensive, so only create one [`FontsImpl`] and then reuse it.
     pub fn new(options: TextOptions, definitions: FontDefinitions) -> Self {
         let mut slf = Self {
+            layout_generation: next_layout_generation(),
             definitions: Arc::new(definitions),
             glyphs: GlyphAtlas::new(options),
             faces: FaceStore::new(options),
@@ -955,4 +1025,18 @@ mod tests {
         let width = view.glyph_width(&FontId::new(12.0, FontFamily::Proportional), ' ');
         assert_eq!(width, 0.0);
     }
+}
+
+/// One native shaping cluster, including marks and ligatures, in job UTF-8 offsets.
+#[derive(Clone, Debug)]
+pub struct ShapedCluster {
+    pub bytes: core::ops::Range<usize>,
+    pub rect: Rect,
+}
+
+/// Native painting plus exact cluster metadata; callers retain logical source separately.
+#[derive(Clone)]
+pub struct ShapedLine {
+    pub galley: Arc<Galley>,
+    pub clusters: Vec<ShapedCluster>,
 }
